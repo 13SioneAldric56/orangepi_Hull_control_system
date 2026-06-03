@@ -15,6 +15,7 @@
 用法:
     python lan_control_hull.py
     python lan_control_hull.py --config lan_control_config.yaml
+    python lan_control_hull.py --legacy   # 原 LAN 导航备案（lan_control_config_legacy.yaml）
 """
 
 from __future__ import annotations
@@ -44,10 +45,73 @@ if _root not in sys.path:
 from compass import OutputMode
 from compass.wrap import HeadingWrapReader
 from Gps.gps import GPSPosition, GPSReader
-from heading_lock_control import HeadingLockController, GPS_AVAILABLE
+from heading_lock_control import (
+    GPS_AVAILABLE,
+    GpsNavigationRunOptions,
+    HeadingLockController,
+    resolve_compass_settings,
+    start_gps_navigation_session,
+)
 
 DEFAULT_CONFIG_PATH = os.path.join(_root, "lan_control_config.yaml")
-COORD_DECIMALS = 5
+LEGACY_CONFIG_PATH = os.path.join(_root, "lan_control_config_legacy.yaml")
+
+# 导航档案：cli_gps 与本地 heading_lock_control.py --gps 一致；lan_legacy 为原 LAN 行为备案
+NAVIGATION_PROFILE_CLI_GPS = {
+    "arrival_threshold": 5.0,
+    "base_speed": 70,
+    "motor_driver": "uart3",
+    "esc_auto_unlock": True,
+    "pid_kp": 0.8,
+    "pid_ki": 0.1,
+    "pid_kd": 1.5,
+    "max_turn_strength": 0.2,
+    "deviation_threshold": 10.0,
+    "pid_p_full_scale_deg": 25.0,
+    "compass_mode": "auto_50hz",
+    "use_heading_wrap": True,
+    "uart_port": "/dev/ttyUSB0",
+    "uart_baud": 115200,
+    "calibration_duration": 2.0,
+    "use_forward_heading_calibration": True,
+    "bearing_recompute_interval": 0.0,
+    "run_duration_sec": 0.0,
+    "post_arrival_reverse_sec": 0.0,
+    "post_arrival_reverse_speed": None,
+    "uart_debug_tx": None,
+    "confirm_interactive": False,
+}
+
+NAVIGATION_PROFILE_LAN_LEGACY = {
+    "arrival_threshold": 5.0,
+    "base_speed": 70,
+    "motor_driver": "uart3",
+    "esc_auto_unlock": True,
+    "pid_kp": 0.8,
+    "pid_ki": 0.1,
+    "pid_kd": 1.5,
+    "max_turn_strength": 0.2,
+    "deviation_threshold": 5.0,
+    "pid_p_full_scale_deg": 25.0,
+    "compass_mode": "auto_50hz",
+    "use_heading_wrap": True,
+    "uart_port": "/dev/ttyUSB0",
+    "uart_baud": 115200,
+    "calibration_duration": 2.0,
+    "use_forward_heading_calibration": True,
+    "bearing_recompute_interval": 0.0,
+    "run_duration_sec": 0.0,
+    "post_arrival_reverse_sec": 5.0,
+    "post_arrival_reverse_speed": None,
+    "uart_debug_tx": False,
+    "confirm_interactive": False,
+}
+
+NAVIGATION_PROFILES = {
+    "cli_gps": NAVIGATION_PROFILE_CLI_GPS,
+    "lan_legacy": NAVIGATION_PROFILE_LAN_LEGACY,
+}
+COORD_DECIMALS = 6
 LAN_SCAN_PING_TIMEOUT_S = 0.5
 LAN_SCAN_MAX_WORKERS = 64
 
@@ -249,6 +313,14 @@ class StandbySensors:
         return lat, lon, heading, gps_valid
 
 
+def _navigation_defaults(profile_name: str) -> Dict[str, Any]:
+    key = (profile_name or "cli_gps").strip().lower()
+    if key not in NAVIGATION_PROFILES:
+        known = ", ".join(sorted(NAVIGATION_PROFILES))
+        raise ValueError(f"未知 navigation_profile: {profile_name!r}，可选: {known}")
+    return dict(NAVIGATION_PROFILES[key])
+
+
 def load_config(path: str) -> Dict[str, Any]:
     if not os.path.isfile(path):
         raise FileNotFoundError(f"配置文件不存在: {path}")
@@ -263,22 +335,63 @@ def load_config(path: str) -> Dict[str, Any]:
     hardware = data.get("hardware") or {}
     navigation = data.get("navigation") or {}
 
+    profile_name = str(navigation.get("profile", navigation.get("navigation_profile", "cli_gps")))
+    nav_defaults = _navigation_defaults(profile_name)
+
+    def _nav(key: str, cast=float, default_key: Optional[str] = None):
+        dk = default_key or key
+        if key in navigation:
+            val = navigation[key]
+            if val is None and dk in ("post_arrival_reverse_speed", "uart_debug_tx"):
+                return nav_defaults.get(dk)
+            return cast(val) if cast is not bool else bool(val)
+        return nav_defaults[dk]
+
+    reverse_speed_raw = navigation.get(
+        "post_arrival_reverse_speed", nav_defaults["post_arrival_reverse_speed"]
+    )
+    post_arrival_reverse_speed = (
+        int(reverse_speed_raw) if reverse_speed_raw is not None else None
+    )
+
+    uart_debug_raw = navigation.get("uart_debug_tx", nav_defaults["uart_debug_tx"])
+    uart_debug_tx = None if uart_debug_raw is None else bool(uart_debug_raw)
+
+    run_duration = float(
+        navigation.get("run_duration_sec", nav_defaults["run_duration_sec"])
+    )
+
     return {
+        "config_path": os.path.abspath(path),
+        "navigation_profile": profile_name,
         "listen_host": str(listen.get("host", "0.0.0.0")),
         "listen_port": int(listen.get("port", 9000)),
         "report_interval": float(report.get("interval", 0.5)),
         "compass_port": str(hardware.get("compass_port", "/dev/ttyS0")),
         "gps_port": str(hardware.get("gps_port", "/dev/ttyS1")),
         "gps_baudrate": int(hardware.get("gps_baudrate", 115200)),
-        "arrival_threshold": float(navigation.get("arrival_threshold", 1.0)),
-        "base_speed": int(navigation.get("base_speed", 50)),
-        "motor_driver": str(navigation.get("motor_driver", "esc")),
-        "esc_auto_unlock": bool(navigation.get("esc_auto_unlock", True)),
-        "pid_kp": float(navigation.get("pid_kp", 2.0)),
-        "pid_ki": float(navigation.get("pid_ki", 0.1)),
-        "pid_kd": float(navigation.get("pid_kd", 0.5)),
-        "max_turn_strength": float(navigation.get("max_turn_strength", 0.2)),
-        "deviation_threshold": float(navigation.get("deviation_threshold", 5.0)),
+        "arrival_threshold": _nav("arrival_threshold", float),
+        "base_speed": _nav("base_speed", int),
+        "motor_driver": str(_nav("motor_driver", str)),
+        "esc_auto_unlock": _nav("esc_auto_unlock", bool),
+        "pid_kp": _nav("pid_kp", float),
+        "pid_ki": _nav("pid_ki", float),
+        "pid_kd": _nav("pid_kd", float),
+        "max_turn_strength": _nav("max_turn_strength", float),
+        "deviation_threshold": _nav("deviation_threshold", float),
+        "pid_p_full_scale_deg": _nav("pid_p_full_scale_deg", float),
+        "compass_mode": str(_nav("compass_mode", str)),
+        "use_heading_wrap": _nav("use_heading_wrap", bool),
+        "uart_port": str(_nav("uart_port", str)),
+        "uart_baud": int(_nav("uart_baud", int)),
+        "calibration_duration": _nav("calibration_duration", float),
+        "use_forward_heading_calibration": _nav("use_forward_heading_calibration", bool),
+        "bearing_recompute_interval": _nav("bearing_recompute_interval", float),
+        "run_duration_sec": run_duration,
+        "post_arrival_reverse_sec": _nav("post_arrival_reverse_sec", float),
+        "post_arrival_reverse_speed": post_arrival_reverse_speed,
+        "uart_debug_tx": uart_debug_tx,
+        "confirm_interactive": _nav("confirm_interactive", bool),
     }
 
 
@@ -553,7 +666,7 @@ class LanControlHull:
 
         lat, lon = parsed
         self._set_runtime(target_lat=lat, target_lon=lon, target_set=True)
-        print(f"[命令] 目标已设置: ({lat:.5f}, {lon:.5f})")
+        print(f"[命令] 目标已设置: ({lat:.6f}, {lon:.6f})")
         self._send_ack("set_target", True)
 
     def _handle_legacy_command(self, msg: Dict[str, Any]) -> None:
@@ -620,6 +733,7 @@ class LanControlHull:
             self._send_ack("stop", True)
 
     def _build_controller(self) -> HeadingLockController:
+        compass_mode, update_interval = resolve_compass_settings(self.config["compass_mode"])
         return HeadingLockController(
             compass_port=self.config["compass_port"],
             base_speed=self.config["base_speed"],
@@ -628,9 +742,28 @@ class LanControlHull:
             pid_ki=self.config["pid_ki"],
             pid_kd=self.config["pid_kd"],
             max_turn_strength=self.config["max_turn_strength"],
+            pid_p_full_scale_deg=self.config["pid_p_full_scale_deg"],
             arrival_threshold_m=self.config["arrival_threshold"],
             motor_driver=self.config["motor_driver"],
             esc_auto_unlock=self.config["esc_auto_unlock"],
+            compass_mode=compass_mode,
+            update_interval=update_interval,
+            use_heading_wrap=self.config["use_heading_wrap"],
+            uart_port=self.config["uart_port"],
+            uart_baud=self.config["uart_baud"],
+        )
+
+    def _gps_run_options(self) -> GpsNavigationRunOptions:
+        duration = self.config["run_duration_sec"]
+        return GpsNavigationRunOptions(
+            calibration_duration=self.config["calibration_duration"],
+            use_forward_heading_calibration=self.config["use_forward_heading_calibration"],
+            bearing_recompute_interval=self.config["bearing_recompute_interval"],
+            confirm_interactive=self.config["confirm_interactive"],
+            duration=None if duration <= 0 else duration,
+            post_arrival_reverse_sec=self.config["post_arrival_reverse_sec"],
+            post_arrival_reverse_speed=self.config["post_arrival_reverse_speed"],
+            uart_debug_tx=self.config["uart_debug_tx"],
         )
 
     def _navigation_worker(self, lat: float, lon: float) -> None:
@@ -643,76 +776,35 @@ class LanControlHull:
         self._standby.stop()
         controller = self._build_controller()
         self._controller = controller
-        arrived = False
         started = False
 
         try:
-            controller.set_gps_target(lat, lon)
-            if not controller._init_gps_navigation(
+            session = start_gps_navigation_session(
+                controller,
+                target_lat=lat,
+                target_lon=lon,
                 gps_port=self.config["gps_port"],
                 gps_baudrate=self.config["gps_baudrate"],
-            ):
-                print("[导航] GPSNavigationController 初始化失败")
-                self._send_json({"type": "status", "state": "error", "message": "GPS 导航初始化失败"})
+                run_options=self._gps_run_options(),
+                abort_event=self._abort_nav,
+            )
+            started = session.started
+
+            if not session.started:
+                self._send_json({"type": "status", "state": "error", "message": "GPS 导航初始化或启动失败"})
                 return
 
-            if not controller._gps_navigation.initialize():
-                print("[导航] GPS 导航初始化失败（含车头校准）")
-                self._send_json({"type": "status", "state": "error", "message": "车头校准或 GPS 初始化失败"})
-                return
-
-            inner_hl = controller._gps_navigation._heading_lock
-            if inner_hl and inner_hl._driver:
-                controller._driver = inner_hl._driver
-            elif not controller._init_motor_driver():
-                print("[导航] 电机驱动初始化失败")
-                return
-
-            controller._gps_navigation._update_navigation()
-            state = controller._gps_navigation.get_state()
-            controller._gps_bearing = state.bearing_angle
-            controller._gps_distance = state.distance_to_target
-            controller._gps_enabled = True
-            controller._target_heading = state.target_heading
-            controller._sync_target_continuous_heading(controller._target_heading)
-            controller._pid.reset()
-            controller._is_running = True
-            started = True
-
-            print(f"[导航] 已启动，目标航向 {controller._target_heading:.1f}°")
-
-            while controller._is_running and not self._abort_nav.is_set():
-                if self._gps_enabled and controller._gps_navigation:
-                    controller.update_gps_navigation(force=True)
-                    nav_state = controller._gps_navigation._state
-                    if nav_state.is_arrived or controller._gps_distance <= controller.arrival_threshold_m:
-                        print(f"[导航] 已到达目标，距离约 {controller._gps_distance:.1f}m")
-                        arrived = True
-                        break
-
-                    inner = controller._gps_navigation._heading_lock
-                    if inner:
-                        current_heading = inner.get_current_heading()
-                        if current_heading is None:
-                            time.sleep(0.05)
-                            continue
-                        continuous_heading = inner.get_continuous_heading()
-                        inner.sync_target_heading(nav_state.target_heading)
-                        controller._target_heading = nav_state.target_heading
-                        error = inner._calculate_heading_error(current_heading, continuous_heading)
-                        inner._apply_pid_correction(error)
-
-                time.sleep(controller.update_interval)
+            if session.arrived:
+                self._send_status("arrived")
 
         except Exception as exc:
             print(f"[导航] 运行异常: {exc}")
             if started:
                 self._send_json({"type": "status", "state": "error", "message": str(exc)})
         finally:
-            if arrived:
-                self._send_status("arrived")
             try:
-                controller.stop()
+                if started and (controller._is_running or controller._gps_navigation is not None):
+                    controller.stop()
             except Exception as exc:
                 print(f"[导航] 停止清理异常: {exc}")
             self._controller = None
@@ -747,6 +839,9 @@ class LanControlHull:
         print("=" * 60)
         print("  船体端局域网控制（TCP 服务端）")
         print("=" * 60)
+        print(f"配置: {self.config.get('config_path', DEFAULT_CONFIG_PATH)}")
+        print(f"导航档案: {self.config.get('navigation_profile', 'cli_gps')} "
+              f"(备案配置: {LEGACY_CONFIG_PATH})")
         print(f"监听: {self.config['listen_host']}:{self.config['listen_port']}")
         print(f"上报周期: {self.config['report_interval']}s")
         local_ips = [local_ip for _, _, local_ip in _iter_local_ipv4_networks()]
@@ -791,9 +886,17 @@ def main() -> None:
         default=DEFAULT_CONFIG_PATH,
         help=f"配置文件路径，默认 {DEFAULT_CONFIG_PATH}",
     )
+    parser.add_argument(
+        "--legacy",
+        action="store_true",
+        help=f"使用原 LAN 导航备案配置 ({LEGACY_CONFIG_PATH})",
+    )
     args = parser.parse_args()
 
-    config = load_config(args.config)
+    config_path = LEGACY_CONFIG_PATH if args.legacy else args.config
+    config = load_config(config_path)
+    if args.legacy:
+        print(f"[配置] 已加载备案档案 lan_legacy: {config_path}")
     app = LanControlHull(config)
     app.run()
 

@@ -1,11 +1,8 @@
-# 船体端局域网控制配置（船在 241 上监听，手机连入）
+# LAN 导航备案配置（原 lan_control_hull 行为，与 cli_gps 档案区分保存）
 #
-# navigation.profile:
-#   cli_gps    — 与本地 python heading_lock_control.py --gps 一致（默认）
-#   lan_legacy — 原 LAN 行为备案（到达后后退 5s、deviation_threshold=5 等）
-#
-# 启用备案: python lan_control_hull.py --legacy
-# 或指定:   python lan_control_hull.py --config lan_control_config_legacy.yaml
+# 用法:
+#   python lan_control_hull.py --legacy
+#   python lan_control_hull.py --config lan_control_config_legacy.yaml
 
 listen:
   host: "0.0.0.0"
@@ -20,7 +17,7 @@ hardware:
   gps_baudrate: 115200
 
 navigation:
-  profile: cli_gps
+  profile: lan_legacy
   arrival_threshold: 5.0
   base_speed: 70
   motor_driver: "uart3"
@@ -29,7 +26,7 @@ navigation:
   pid_ki: 0.1
   pid_kd: 1.5
   max_turn_strength: 0.2
-  deviation_threshold: 10.0
+  deviation_threshold: 5.0
   pid_p_full_scale_deg: 25
   compass_mode: auto_50hz
   use_heading_wrap: true
@@ -39,7 +36,6 @@ navigation:
   use_forward_heading_calibration: true
   bearing_recompute_interval: 0.0
   run_duration_sec: 0
-  post_arrival_reverse_sec: 0
+  post_arrival_reverse_sec: 5
   # post_arrival_reverse_speed: 90
-  # uart_debug_tx: false
-  # confirm_interactive: false
+  uart_debug_tx: false

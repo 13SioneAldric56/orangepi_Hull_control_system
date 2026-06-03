@@ -27,7 +27,7 @@ import sys
 import time
 import math
 import threading
-from typing import Optional, Tuple, Callable
+from typing import TYPE_CHECKING, Optional, Tuple, Callable
 from dataclasses import dataclass
 
 sys.path.insert(0, __file__.rsplit('/', 1)[0] if '/' in __file__ else '.')
@@ -36,8 +36,10 @@ _root_path = __file__.rsplit('/Gps/', 1)[0] if '/Gps/' in __file__ else __file__
 sys.path.insert(0, _root_path)
 
 from Gps.gps import GPSReader, GPSPosition
-from heading_lock_control import HeadingLockController
 from compass import OutputMode
+
+if TYPE_CHECKING:
+    from heading_lock_control import HeadingLockController
 
 
 @dataclass
@@ -115,7 +117,7 @@ class GPSNavigationController:
         self._heading_lock_config.setdefault('compass_port', compass_port)
 
         self._gps_reader: Optional[GPSReader] = None
-        self._heading_lock: Optional[HeadingLockController] = None
+        self._heading_lock: Optional["HeadingLockController"] = None
 
         self._current_position: Optional[GPSPosition] = None
         self._position_lock = threading.Lock()
@@ -186,6 +188,8 @@ class GPSNavigationController:
     def _init_heading_lock(self) -> bool:
         """初始化航向角锁定控制器"""
         try:
+            from heading_lock_control import HeadingLockController
+
             config = self._heading_lock_config.copy()
             config['compass_port'] = self.compass_port
             config.setdefault('base_speed', self.calibration_speed)
