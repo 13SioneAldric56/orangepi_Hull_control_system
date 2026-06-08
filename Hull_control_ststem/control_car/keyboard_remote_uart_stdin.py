@@ -4,7 +4,7 @@ SSH / 终端键盘遥控 — UART3 双轮（命令码 0x06）
 控制逻辑与 keyboard_remote_stdin.py 相同；速度经串口发出。
 每 50ms 检测一次：若无新的 WASD 输入则发送 0x00 停转帧。
 
-用法: python3 keyboard_remote_uart_stdin.py [--uart-port /dev/ttyUSB0]
+用法: python3 keyboard_remote_uart_stdin.py [--uart-port /dev/ttyUSB1]
 """
 from __future__ import annotations
 
@@ -80,7 +80,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="终端 WASD UART3 双轮遥控 (0x06)")
     p.add_argument("--speed", "-s", type=int, default=50, help="初始速度 0～100")
     p.add_argument(
-        "--uart-port", default="/dev/ttyUSB0", help="电机 UART 设备，默认 /dev/ttyUSB0"
+        "--uart-port", default="/dev/ttyUSB1", help="电机 UART 设备，默认 /dev/ttyUSB1"
     )
     p.add_argument("--uart-baud", type=int, default=115200, help="波特率，默认 115200")
     p.add_argument(

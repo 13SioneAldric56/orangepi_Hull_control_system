@@ -22,20 +22,23 @@ navigation:
   base_speed: 70
   motor_driver: "uart3"
   esc_auto_unlock: true
-  pid_kp: 0.8
-  pid_ki: 0.1
-  pid_kd: 1.5
-  max_turn_strength: 0.2
-  deviation_threshold: 5.0
-  pid_p_full_scale_deg: 25
+  straight_threshold_deg: 10.0
+  gear_hysteresis_deg: 2.0
+  heading_gears:
+    - { max_error_deg: 30, left: 0.5,  right: 1.0,  label: "1档·双前进", mode: forward_diff }
+    - { max_error_deg: 50, left: -0.5, right: 0.5,  label: "2档·50%",    mode: spin }
+    - { max_error_deg: 70, left: -0.7, right: 0.7,  label: "3档·70%",    mode: spin }
+    - { max_error_deg: 90, left: -0.9, right: 0.9,  label: "4档·90%",    mode: spin }
+    - { max_error_deg: 9999, left: -1.0, right: 1.0, label: "5档·满转",   mode: spin }
+  deviation_threshold: 10.0
   compass_mode: auto_50hz
   use_heading_wrap: true
-  uart_port: "/dev/ttyUSB0"
+  uart_port: "/dev/ttyUSB1"
   uart_baud: 115200
   calibration_duration: 2.0
   use_forward_heading_calibration: true
   bearing_recompute_interval: 0.0
   run_duration_sec: 0
-  post_arrival_reverse_sec: 5
+  post_arrival_reverse_sec: 7
   # post_arrival_reverse_speed: 90
   uart_debug_tx: false

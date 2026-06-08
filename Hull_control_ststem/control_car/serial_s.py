@@ -11,7 +11,7 @@ import time
 import sys
 
 # ==================== 串口配置 ====================
-PORT = "/dev/ttyUSB0"      # 串口名 (Linux: /dev/ttyUSB0, Windows: COM3)
+PORT = "/dev/ttyUSB1"      # 串口名 (Linux: /dev/ttyUSB1, Windows: COM3)
 BAUDRATE = 115200          # 波特率
 TIMEOUT = 1                # 超时时间（秒）
 

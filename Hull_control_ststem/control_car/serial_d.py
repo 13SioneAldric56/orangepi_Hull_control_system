@@ -40,7 +40,7 @@ def serial_loopback_test(port: str, baudrate: int = 115200,
     串口回环测试
     
     Args:
-        port: 串口号，如 '/dev/ttyS0' 或 '/dev/ttyUSB0'
+        port: 串口号，如 '/dev/ttyS0' 或 '/dev/ttyUSB1'
         baudrate: 波特率，默认 115200
         test_data: 测试数据字符串
         timeout: 读取超时时间（秒）

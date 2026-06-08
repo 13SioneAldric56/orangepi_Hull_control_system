@@ -1,5 +1,5 @@
 """
-UART 电机控制帧（命令码 0x06）— /dev/ttyUSB0 等
+UART 电机控制帧（命令码 0x06）— /dev/ttyUSB1 等
 
 帧格式（11 字节）:
   AA 55       帧头

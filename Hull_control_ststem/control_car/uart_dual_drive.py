@@ -1,5 +1,5 @@
 """
-双轮 UART 差速驱动 — /dev/ttyUSB0，命令码 0x06（11 字节档位帧）
+双轮 UART 差速驱动 — /dev/ttyUSB1，命令码 0x06（11 字节档位帧）
 
 接口与 esc_dual_drive.EscDifferentialDrive 对齐，供航向锁 / 键盘遥控复用。
 不占用 pwmchip；每次速度变化通过串口发帧。
@@ -23,7 +23,7 @@ try:
 except ImportError:
     from uart_motor_protocol import COMPARE_MAP, build_frame_v06, speed_to_index
 
-DEFAULT_UART_PORT = "/dev/ttyUSB0"
+DEFAULT_UART_PORT = "/dev/ttyUSB1"
 DEFAULT_BAUD = 115200
 DEFAULT_MIN_SEND_INTERVAL = 0.05
 DEFAULT_DEBUG_TX = True
@@ -105,9 +105,22 @@ class UartDifferentialDrive:
         self._is_moving = False
         self._last_sent: Optional[Tuple[int, int]] = None
         self._last_send_time = 0.0
+        self._serial_ok = True
+
+    def _invalidate_serial(self) -> None:
+        """关闭失效串口，避免对已断开设备反复 write。"""
+        self._serial_ok = False
+        self._last_sent = None
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            except OSError:
+                pass
+            self._ser = None
 
     def init(self) -> None:
         if self._ser and self._ser.is_open:
+            self._serial_ok = True
             return
         self._ser = serial.Serial(
             port=self.port,
@@ -121,12 +134,13 @@ class UartDifferentialDrive:
             dsrdtr=False,
         )
         self._ser.reset_input_buffer()
+        self._serial_ok = True
         print(f"[UartDrive] 已打开 {self.port} @ {self.baud}")
         self.stop()
 
-    def _flush_send(self, left_idx: int, right_idx: int, force: bool = False) -> None:
+    def _flush_send(self, left_idx: int, right_idx: int, force: bool = False) -> bool:
         if not self._ser or not self._ser.is_open:
-            return
+            return False
         pair = (left_idx & 0xFF, right_idx & 0xFF)
         now = time.monotonic()
         if (
@@ -134,14 +148,15 @@ class UartDifferentialDrive:
             and pair == self._last_sent
             and (now - self._last_send_time) < self.min_send_interval
         ):
-            return
+            return True
         pkt = build_frame_v06(pair[0], pair[1])
         try:
             n = self._ser.write(pkt)
             self._ser.flush()
-        except serial.SerialException as exc:
+        except (serial.SerialException, OSError) as exc:
             print(f"[UartDrive] 串口发送失败: {exc}", flush=True)
-            raise
+            self._invalidate_serial()
+            return False
         if n != len(pkt):
             print(
                 f"[UartDrive] 警告: 仅写入 {n}/{len(pkt)} 字节",
@@ -155,6 +170,8 @@ class UartDifferentialDrive:
             )
         self._last_sent = pair
         self._last_send_time = now
+        self._serial_ok = True
+        return True
 
     def _apply_side(self, motor: UartMotor, factor: float, speed: int) -> None:
         wheel_speed = abs(int(speed * factor))
@@ -193,9 +210,11 @@ class UartDifferentialDrive:
     def stop(self, brake: bool = True) -> None:
         self.left_motor._last_index = 0x00
         self.right_motor._last_index = 0x00
-        self._flush_send(0x00, 0x00, force=True)
+        if not self._flush_send(0x00, 0x00, force=True):
+            print("[停止] UART 停止帧未发出（串口不可用）")
         self._is_moving = False
-        print("[停止] UART 档位 0x00")
+        if self._serial_ok:
+            print("[停止] UART 档位 0x00")
 
     def differential_turn(self, direction: str, speed: int = None) -> None:
         if direction not in self.TURN_PROFILES:
@@ -245,15 +264,9 @@ class UartDifferentialDrive:
     def shutdown(self) -> None:
         try:
             self.stop()
-        except OSError:
+        except (OSError, serial.SerialException):
             pass
-        if self._ser:
-            try:
-                self._ser.close()
-            except OSError:
-                pass
-            self._ser = None
-        self._last_sent = None
+        self._invalidate_serial()
         print("[UartDrive] 串口已关闭")
 
 

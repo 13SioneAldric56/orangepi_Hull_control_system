@@ -1,13 +1,13 @@
 """
 航向角锁定自动驾驶控制模块
 
-结合卡尔曼滤波罗盘、档位表差速与差速驱动，实现航向角锁定自动修正功能
+结合卡尔曼滤波罗盘、PID控制器与差速驱动，实现航向角锁定自动修正功能
 
 功能特性:
 1. 启动时锁定当前航向角作为目标航向
-2. 实时检测航向角偏差，按 5 档档位表进行差速修正（≤10° 直行）
-3. 支持参数配置（档位边界、滞回、base_speed 等）
-4. ≤30° 双轮同向前进差速，>30° 一正一反原地转向
+2. 实时检测航向角偏差，使用PID控制器进行精确修正
+3. 支持参数配置（PID参数、偏差阈值等）
+4. 差速修正根据偏差大小动态调整
 5. 集成航向角回环处理模块，解决 0°/360° 边界跳变问题
 
 使用示例:
@@ -16,6 +16,9 @@
     controller = HeadingLockController(
         compass_port='/dev/ttyS0',
         base_speed=50,
+        pid_kp=2.0,
+        pid_ki=0.1,
+        pid_kd=0.5
     )
     controller.start()
     controller.run_loop(duration=60)
@@ -26,7 +29,7 @@ import time
 import math
 import threading
 from dataclasses import dataclass
-from typing import Optional, Tuple, Callable, List, Union, Any
+from typing import Optional, Tuple, Callable
 
 sys.path.insert(0, __file__.rsplit('/', 1)[0] if '/' in __file__ else '.')
 
@@ -175,16 +178,15 @@ def start_gps_navigation_session(
     controller._target_heading = state.target_heading
     controller._sync_target_continuous_heading(controller._target_heading)
     controller._pid.reset()
-    controller._active_gear_index = 0
     controller._is_running = True
 
     print(f"[启动] 航向角锁定控制已启动，目标航向: {controller._target_heading:.1f}°")
     inner = controller._gps_navigation._heading_lock
-    gear_src = inner if inner else controller
+    pid_src = inner._pid if inner else controller._pid
     print(
-        f"[档位] 直行≤{gear_src.straight_threshold_deg:.0f}°, "
-        f"滞回={gear_src.gear_hysteresis_deg:.0f}°, "
-        f"修正档={len(gear_src.heading_gears)}"
+        f"[PID] Kp={pid_src.kp}, Ki={pid_src.ki}, Kd={pid_src.kd}, "
+        f"P满量程={pid_src.p_full_scale_deg}°, "
+        f"输出限幅=±{inner.max_turn_strength if inner else controller.max_turn_strength}"
     )
 
     if opts.uart_debug_tx is not None:
@@ -204,70 +206,6 @@ def start_gps_navigation_session(
         and controller._gps_distance <= controller.arrival_threshold_m
     )
     return GpsSessionResult(started=True, arrived=arrived)
-
-
-@dataclass
-class HeadingGear:
-    """航向修正档位（左转时 left/right 系数；右转时左右对调）。"""
-
-    max_error_deg: float
-    left_factor: float
-    right_factor: float
-    label: str = ""
-    mode: str = "spin"  # "forward_diff" | "spin"
-
-
-DEFAULT_HEADING_GEARS: List[HeadingGear] = [
-    HeadingGear(30, 0.5, 1.0, "1档·双前进", "forward_diff"),
-    HeadingGear(50, -0.5, 0.5, "2档·50%", "spin"),
-    HeadingGear(70, -0.7, 0.7, "3档·70%", "spin"),
-    HeadingGear(90, -0.9, 0.9, "4档·90%", "spin"),
-    HeadingGear(9999.0, -1.0, 1.0, "5档·满转", "spin"),
-]
-
-
-def parse_heading_gears(raw: Any) -> List[HeadingGear]:
-    """从 YAML/字典列表解析档位表；None 则使用 DEFAULT_HEADING_GEARS。"""
-    if raw is None:
-        return list(DEFAULT_HEADING_GEARS)
-    if not isinstance(raw, (list, tuple)):
-        raise ValueError("heading_gears 须为列表")
-    gears: List[HeadingGear] = []
-    for i, item in enumerate(raw):
-        if isinstance(item, HeadingGear):
-            gears.append(item)
-            continue
-        if not isinstance(item, dict):
-            raise ValueError(f"heading_gears[{i}] 须为字典或 HeadingGear")
-        left = float(item["left"])
-        right = float(item["right"])
-        mode = str(item.get("mode", "forward_diff" if left >= 0 and right >= 0 else "spin"))
-        gears.append(
-            HeadingGear(
-                max_error_deg=float(item["max_error_deg"]),
-                left_factor=left,
-                right_factor=right,
-                label=str(item.get("label", f"{i + 1}档")),
-                mode=mode,
-            )
-        )
-    if not gears:
-        raise ValueError("heading_gears 不能为空")
-    return gears
-
-
-def heading_gears_to_dicts(gears: List[HeadingGear]) -> List[dict]:
-    """档位表序列化，供 heading_lock_config / YAML 使用。"""
-    return [
-        {
-            "max_error_deg": g.max_error_deg,
-            "left": g.left_factor,
-            "right": g.right_factor,
-            "label": g.label,
-            "mode": g.mode,
-        }
-        for g in gears
-    ]
 
 
 class PIDController:
@@ -403,17 +341,14 @@ class HeadingLockController:
     """
     航向角锁定控制器
 
-    通过罗盘获取航向角，锁定目标航向，按档位表进行差速修正
+    通过罗盘获取航向角，锁定目标航向，使用PID控制器进行精确差速修正
     """
 
     def __init__(
         self,
         compass_port: str = '/dev/ttyS0',
         base_speed: int = 80,
-        deviation_threshold: float = 10.0,
-        straight_threshold_deg: Optional[float] = None,
-        gear_hysteresis_deg: float = 2.0,
-        heading_gears: Optional[Union[List[HeadingGear], List[dict]]] = None,
+        deviation_threshold: float = 5.0,
         pid_kp: float = 2.0,
         pid_ki: float = 0.1,
         pid_kd: float = 0.5,
@@ -437,13 +372,18 @@ class HeadingLockController:
 
         Args:
             compass_port: 罗盘串口设备路径
-            base_speed: 基础速度 (0-100)，直行与转弯共用
-            deviation_threshold: 直行死区(度)，与 straight_threshold_deg 统一，默认 10°
-            straight_threshold_deg: 直行阈值(度)，默认与 deviation_threshold 相同
-            gear_hysteresis_deg: 档位切换滞回(度)，默认 2°
-            heading_gears: 修正档位表（5 档），None 使用 DEFAULT_HEADING_GEARS
-            pid_kp/ki/kd: 保留兼容，当前控制不使用 PID
+            base_speed: 直行基础速度 (0-100)
+                        注意: 值越大速度越慢
+            deviation_threshold: 偏差死区阈值(度)，低于此值不进行修正
+            pid_kp: PID比例系数
+            pid_ki: PID积分系数
+            pid_kd: PID微分系数
+            process_noise: 卡尔曼滤波过程噪声
+            measurement_noise: 卡尔曼滤波测量噪声
             update_interval: 控制周期(秒)，默认0.02s匹配50Hz输出
+            min_turn_strength: 最小转弯强度 (0.0 ~ 1.0)
+            max_turn_strength: 最大转弯强度 (0.0 ~ 1.0)，亦为 PID 输出上限
+            pid_p_full_scale_deg: P 项满量程航向误差(度)，|error| 接近该值时 P 项≈kp
             compass_mode: 罗盘输出模式，默认AUTO_50HZ (50Hz)
             use_heading_wrap: 是否使用航向角回环处理（解决0°/360°边界跳变）
             bearing_update_interval: GPS模式下重算目标方位角周期(秒)
@@ -463,14 +403,7 @@ class HeadingLockController:
 
         self.compass_port = compass_port
         self.base_speed = base_speed
-        self.straight_threshold_deg = (
-            float(straight_threshold_deg)
-            if straight_threshold_deg is not None
-            else float(deviation_threshold)
-        )
-        self.deviation_threshold = self.straight_threshold_deg
-        self.gear_hysteresis_deg = max(0.0, float(gear_hysteresis_deg))
-        self.heading_gears = parse_heading_gears(heading_gears)
+        self.deviation_threshold = deviation_threshold
         self.update_interval = update_interval
         self.min_turn_strength = min_turn_strength
         self.max_turn_strength = max_turn_strength
@@ -480,7 +413,6 @@ class HeadingLockController:
         self.bearing_update_interval = max(0.1, bearing_update_interval)
         self.arrival_threshold_m = max(0.1, arrival_threshold_m)
 
-        # PID 保留实例供兼容/GPS 配置，当前控制循环不使用 compute()
         self._pid = PIDController(
             kp=pid_kp,
             ki=pid_ki,
@@ -504,14 +436,8 @@ class HeadingLockController:
         self._debug: bool = False
         self._last_left_speed: int = 0
         self._last_right_speed: int = 0
-        self._last_left_factor: float = 0.0
-        self._last_right_factor: float = 0.0
         self._last_pid_output: float = 0.0
         self._last_turn_correction: float = 0.0
-        self._active_gear_index: int = 0
-        self._last_gear_label: str = "直行"
-        self._last_turn_mode: str = "straight"
-        self._motor_fault: bool = False
 
         self._stats = {
             'max_error': 0.0,
@@ -537,10 +463,7 @@ class HeadingLockController:
         defaults = {
             'compass_port': '/dev/ttyS0',
             'base_speed': 80,
-            'deviation_threshold': 10.0,
-            'straight_threshold_deg': 10.0,
-            'gear_hysteresis_deg': 2.0,
-            'heading_gears': heading_gears_to_dicts(DEFAULT_HEADING_GEARS),
+            'deviation_threshold': 5.0,
             'pid_kp': 2.0,
             'pid_ki': 0.1,
             'pid_kd': 0.5,
@@ -569,9 +492,6 @@ class HeadingLockController:
             compass_port=self.compass_port,
             base_speed=self.base_speed,
             deviation_threshold=self.deviation_threshold,
-            straight_threshold_deg=self.straight_threshold_deg,
-            gear_hysteresis_deg=self.gear_hysteresis_deg,
-            heading_gears=heading_gears_to_dicts(self.heading_gears),
             pid_kp=self._pid.kp,
             pid_ki=self._pid.ki,
             pid_kd=self._pid.kd,
@@ -632,9 +552,10 @@ class HeadingLockController:
                 bearing_recompute_interval=bearing_recompute_interval,
             )
             print(
-                f"[GPS] 内层航向锁档位: 直行≤{heading_lock_config.get('straight_threshold_deg', 10)}°, "
-                f"滞回={heading_lock_config.get('gear_hysteresis_deg', 2)}°, "
-                f"档位数={len(heading_lock_config.get('heading_gears', []))}"
+                f"[GPS] 内层航向锁 PID: Kp={heading_lock_config['pid_kp']}, "
+                f"Ki={heading_lock_config['pid_ki']}, Kd={heading_lock_config['pid_kd']}, "
+                f"P满量程={heading_lock_config.get('pid_p_full_scale_deg', 30)}°, "
+                f"max_turn={heading_lock_config['max_turn_strength']}"
             )
             print(f"[GPS] GPSNavigationController已初始化")
             return True
@@ -803,12 +724,12 @@ class HeadingLockController:
             return
         try:
             self._driver.stop()
-        except (OSError, Exception) as e:
+        except OSError as e:
             print(f"[警告] 驱动 stop 异常: {e}")
         if hasattr(self._driver, 'shutdown'):
             try:
                 self._driver.shutdown()
-            except (OSError, Exception) as e:
+            except OSError as e:
                 print(f"[警告] 驱动 shutdown 异常: {e}")
         self._driver = None
 
@@ -892,146 +813,61 @@ class HeadingLockController:
 
         self._target_continuous_heading = current_continuous + delta
 
-    def _gear_thresholds(self) -> List[float]:
-        """档位边界：直行 + 各修正档上限 (度)。"""
-        return [self.straight_threshold_deg] + [g.max_error_deg for g in self.heading_gears]
-
-    def _resolve_gear_index(self, abs_error: float) -> int:
-        """
-        带滞回的档位索引：0=直行，1~N=修正档。
-        升档需超过边界+滞回；降档需低于边界-滞回。
-        """
-        thresholds = self._gear_thresholds()
-        h = self.gear_hysteresis_deg
-        idx = self._active_gear_index
-
-        while idx < len(thresholds) - 1:
-            if abs_error > thresholds[idx] + h:
-                idx += 1
-            else:
-                break
-
-        while idx > 0:
-            if abs_error <= thresholds[idx - 1] - h:
-                idx -= 1
-            else:
-                break
-
-        self._active_gear_index = idx
-        return idx
-
-    def _apply_motor_factors(self, left_factor: float, right_factor: float) -> bool:
-        """按左右系数驱动电机，speed 使用 base_speed。失败时返回 False。"""
-        if self._driver is None:
-            return False
-        speed = self.base_speed
-        try:
-            if hasattr(self._driver, 'custom_turn'):
-                self._driver.custom_turn(left_factor, right_factor, speed)
-            else:
-                for motor, factor in (
-                    (self._driver.left_motor, left_factor),
-                    (self._driver.right_motor, right_factor),
-                ):
-                    wheel_speed = abs(int(speed * factor))
-                    if wheel_speed <= 0:
-                        motor.stop()
-                    elif factor >= 0:
-                        motor.forward(wheel_speed)
-                    else:
-                        motor.reverse(wheel_speed)
-        except Exception as exc:
-            if not self._motor_fault:
-                print(f"[驱动] 电机指令失败 ({self.motor_driver}): {exc}")
-            self._motor_fault = True
-            return False
-
-        self._motor_fault = False
-        self._last_left_factor = float(left_factor)
-        self._last_right_factor = float(right_factor)
-        self._last_left_speed = int(speed * abs(left_factor))
-        self._last_right_speed = int(speed * abs(right_factor))
-        return True
-
-    def _apply_motor_forward(self) -> bool:
-        """直行指令，失败时返回 False。"""
-        if self._driver is None:
-            return False
-        try:
-            self._driver.forward(self.base_speed)
-        except Exception as exc:
-            if not self._motor_fault:
-                print(f"[驱动] 直行指令失败 ({self.motor_driver}): {exc}")
-            self._motor_fault = True
-            return False
-        self._motor_fault = False
-        self._last_left_factor = 1.0
-        self._last_right_factor = 1.0
-        self._last_left_speed = self.base_speed
-        self._last_right_speed = self.base_speed
-        return True
-
-    def _apply_heading_correction(self, error: float) -> None:
-        """
-        按档位表应用航向修正（非 PID）。
-
-        - |error| ≤ straight_threshold: 直行
-        - (10°, 30°]: 双轮同向前进差速
-        - (30°, 50/70/90°]: 一正一反，强度 50%/70%/90%
-        - >90°: 100% 原地转向
-        """
-        if self._driver is None:
-            return
-
-        abs_error = abs(error)
-        if abs_error > self._stats['max_error']:
-            self._stats['max_error'] = abs_error
-
-        gear_idx = self._resolve_gear_index(abs_error)
-
-        if gear_idx == 0:
-            self._last_gear_label = "直行"
-            self._last_turn_mode = "straight"
-            self._last_turn_correction = 0.0
-            self._last_pid_output = 0.0
-            self._apply_motor_forward()
-            return
-
-        gear = self.heading_gears[gear_idx - 1]
-        self._last_gear_label = gear.label or f"{gear_idx}档"
-        self._last_turn_mode = gear.mode
-
-        if error > 0:
-            left_factor, right_factor = gear.left_factor, gear.right_factor
-        else:
-            left_factor, right_factor = gear.right_factor, gear.left_factor
-
-        turn = max(abs(left_factor), abs(right_factor))
-        self._last_turn_correction = turn
-        self._last_pid_output = turn
-
-        self._apply_motor_factors(left_factor, right_factor)
-
     def _apply_pid_correction(self, error: float):
         """
-        [已弃用 PID] 原 PID 差速修正，现改为档位表控制。
+        使用PID控制器应用差速修正
 
         修正逻辑（一正一反转弯，与 spin_left/spin_right 一致）:
         - error > 0 (航向偏右) → 需要左转 → 左反转、右正转
         - error < 0 (航向偏左) → 需要右转 → 左正转、右反转
-        """
-        # --- PID 控制（已注释，保留供参考） ---
-        # if self._driver is None:
-        #     return
-        # pid_output = self._pid.compute(error, self.update_interval)
-        # self._last_pid_output = pid_output
-        # if abs(pid_output) < 0.01:
-        #     self._driver.forward(self.base_speed)
-        #     ...
-        # turn = max(self.min_turn_strength, min(1.0, abs(pid_output)))
-        # ...
 
-        self._apply_heading_correction(error)
+        PID 输出已限幅在 [-max_turn_strength, +max_turn_strength]，其绝对值作为转弯强度 (0~1)。
+
+        Args:
+            error: 航向角偏差 (-180° ~ 180°)
+        """
+        if self._driver is None:
+            return
+
+        pid_output = self._pid.compute(error, self.update_interval)
+        self._last_pid_output = pid_output
+
+        if abs(pid_output) < 0.01:
+            self._driver.forward(self.base_speed)
+            self._last_left_speed = self.base_speed
+            self._last_right_speed = self.base_speed
+            self._last_turn_correction = 0.0
+            return
+
+        turn = max(self.min_turn_strength, min(1.0, abs(pid_output)))
+        if error > 0:
+            left_factor = -turn
+            right_factor = turn
+        else:
+            left_factor = turn
+            right_factor = -turn
+        self._last_turn_correction = turn
+
+        if hasattr(self._driver, 'custom_turn'):
+            self._driver.custom_turn(left_factor, right_factor, self.base_speed)
+        else:
+            for motor, factor in (
+                (self._driver.left_motor, left_factor),
+                (self._driver.right_motor, right_factor),
+            ):
+                wheel_speed = abs(int(self.base_speed * factor))
+                if wheel_speed <= 0:
+                    motor.stop()
+                elif factor >= 0:
+                    motor.forward(wheel_speed)
+                else:
+                    motor.reverse(wheel_speed)
+
+        self._last_left_speed = int(self.base_speed * abs(left_factor))
+        self._last_right_speed = int(self.base_speed * abs(right_factor))
+
+        if abs(error) > self._stats['max_error']:
+            self._stats['max_error'] = abs(error)
 
     def start(self, calibrate: bool = True) -> bool:
         """启动航向角锁定控制"""
@@ -1052,30 +888,17 @@ class HeadingLockController:
                 return False
 
         self._pid.reset()
-        self._active_gear_index = 0
-        self._last_gear_label = "直行"
         self._is_running = True
         self._last_update_time = time.time()
         print("[启动] 航向角锁定控制已启动 (Ctrl+C 停止)")
-        print(
-            f"[档位] 直行≤{self.straight_threshold_deg:.0f}°, "
-            f"滞回={self.gear_hysteresis_deg:.0f}°, "
-            f"修正档={len(self.heading_gears)}"
-        )
+        print(f"[PID] Kp={self._pid.kp}, Ki={self._pid.ki}, Kd={self._pid.kd}")
         return True
-
-    @staticmethod
-    def _format_wheel_display(factor: float, speed_pct: int) -> str:
-        """格式化单轮速度：百分比 + 正转/反转/停止。"""
-        if speed_pct <= 0 or abs(factor) < 1e-6:
-            return " 0% 停"
-        direction = "正转" if factor > 0 else "反转"
-        return f"{speed_pct:>3d}% {direction}"
 
     def _format_info_panel(
         self,
         current_heading: float,
         error: float,
+        pid_state: dict,
         status: str,
         elapsed_time: float,
         continuous_heading: float = None,
@@ -1083,20 +906,14 @@ class HeadingLockController:
         subtitle_line: str = None,
     ) -> str:
         """格式化信息面板"""
+        panel_width = 60
+
         error_bar = self._make_error_bar(error)
 
-        left_speed_display = self._format_wheel_display(
-            self._last_left_factor, self._last_left_speed
-        )
-        right_speed_display = self._format_wheel_display(
-            self._last_right_factor, self._last_right_speed
-        )
-        mode_label = {
-            "straight": "直行",
-            "forward_diff": "双前进差速",
-            "spin": "正反转转向",
-        }.get(self._last_turn_mode, self._last_turn_mode)
-        fault_hint = "  [串口/驱动异常]" if self._motor_fault else ""
+        left_speed_display = self._last_left_speed
+        right_speed_display = self._last_right_speed
+        p_norm = pid_state['kp'] * error / pid_state.get('p_full_scale_deg', 30.0)
+        pid_out = pid_state.get('last_output', self._last_pid_output)
 
         uptime = self._format_uptime(elapsed_time)
         status_icon = "✓" if status == "直行" else "⟲"
@@ -1126,14 +943,14 @@ class HeadingLockController:
 ║  航向偏差: {error:>+6.1f}°  {error_bar}                            ║
 {gps_lines}
 ╠══════════════════════════════════════════════════════════════════════╣
-║  档位控制                                                             ║
-║    ├─ 当前档位: {self._last_gear_label:<12}  模式: {mode_label:<10}              ║
-║    ├─ 转向强度: {self._last_turn_correction * 100:>4.0f}%  档位索引: {self._active_gear_index:<2d}  滞回: {self.gear_hysteresis_deg:.0f}°       ║
-║    └─ 直行阈值: ≤{self.straight_threshold_deg:.0f}°  修正档数: {len(self.heading_gears)}                              ║
+║  PID 控制输出                                                         ║
+║    ├─ Kp: {pid_state['kp']:>5.2f}  │  P(归一化): {p_norm:>+6.3f}  实际输出: {pid_out:>+5.3f}   ║
+║    ├─ Ki: {pid_state['ki']:>5.2f}  │  I输出: {pid_state['ki']*pid_state['integral']:>+7.3f}                     ║
+║    └─ Kd: {pid_state['kd']:>5.2f}  │  D输出: {pid_state['kd']*pid_state['filtered_derivative']:>+7.3f}  差速: {self._last_turn_correction:>4.2f} ║
 ╠══════════════════════════════════════════════════════════════════════╣
-║  驱动/电机 (已施加)  类型: {self.motor_driver:<8}{fault_hint:<18}              ║
-║    ├─ 基础速度: {self.base_speed:>3d}%                                            ║
-║    └─ 左右速度: 左 {left_speed_display:<10}  右 {right_speed_display:<10}              ║
+║  驱动/电机 (已施加)  类型: {self.motor_driver:<8}                              ║
+║    ├─ 基础速度: {self.base_speed:>3d}%  最大差速: {self.max_turn_strength:>4.2f}                    ║
+║    └─ 左右速度: 左 {left_speed_display:>3d}%  右 {right_speed_display:>3d}%                      ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  统计信息                                                             ║
 ║    ├─ 最大偏差: {self._stats['max_error']:>5.1f}°                                     ║
@@ -1144,7 +961,7 @@ class HeadingLockController:
 
     def _make_error_bar(self, error: float, bar_width: int = 15) -> str:
         """创建偏差可视化条"""
-        max_error = 90.0
+        max_error = 30.0
         normalized = max(-1, min(1, error / max_error))
         bar_len = int(abs(normalized) * bar_width)
 
@@ -1178,10 +995,14 @@ class HeadingLockController:
         subtitle_line: str = None,
     ):
         """更新终端显示（覆盖式刷新）"""
-        status = "直行" if self._active_gear_index == 0 else "修正中"
+        pid_source = self._pid
+        if self._gps_enabled and self._gps_navigation and self._gps_navigation._heading_lock:
+            pid_source = self._gps_navigation._heading_lock._pid
+        pid_state = pid_source.get_state()
+        status = "直行" if abs(error) < self.deviation_threshold else "修正中"
 
         panel = self._format_info_panel(
-            current_heading, error, status, elapsed_time,
+            current_heading, error, pid_state, status, elapsed_time,
             continuous_heading, gps_state, subtitle_line=subtitle_line,
         )
 
@@ -1284,7 +1105,7 @@ class HeadingLockController:
                             time.sleep(0.05)
                             continue
                         continuous_heading = inner_heading_lock.get_continuous_heading()
-                        # 误差与档位修正由内层航向锁计算（与 heading_lock_config 一致）
+                        # 误差与 PID 由内层航向锁计算（与 heading_lock_config 一致）
                         inner_heading_lock.sync_target_heading(state.target_heading)
                         self._target_heading = state.target_heading
                         error = inner_heading_lock._calculate_heading_error(
@@ -1323,22 +1144,13 @@ class HeadingLockController:
                 # 在GPS模式下使用内部HeadingLockController的驱动
                 if self._gps_enabled and self._gps_navigation and self._gps_navigation._heading_lock:
                     inner_hl = self._gps_navigation._heading_lock
-                    inner_hl._apply_heading_correction(error)
+                    inner_hl._apply_pid_correction(error)
                     self._last_left_speed = inner_hl._last_left_speed
                     self._last_right_speed = inner_hl._last_right_speed
-                    self._last_left_factor = inner_hl._last_left_factor
-                    self._last_right_factor = inner_hl._last_right_factor
                     self._last_pid_output = inner_hl._last_pid_output
                     self._last_turn_correction = inner_hl._last_turn_correction
-                    self._last_gear_label = inner_hl._last_gear_label
-                    self._last_turn_mode = inner_hl._last_turn_mode
-                    self._active_gear_index = inner_hl._active_gear_index
-                    self._motor_fault = inner_hl._motor_fault
-                    self._stats['max_error'] = max(
-                        self._stats['max_error'], inner_hl._stats['max_error']
-                    )
                 else:
-                    self._apply_heading_correction(error)
+                    self._apply_pid_correction(error)
 
                 loop_end_time = time.time()
                 elapsed = loop_end_time - start_time
@@ -1409,8 +1221,6 @@ class HeadingLockController:
         self._target_heading = heading % 360
         self._sync_target_continuous_heading(self._target_heading)
         self._pid.reset()
-        self._active_gear_index = 0
-        self._last_gear_label = "直行"
         print(f"[设置] 目标航向角已更新: {self._target_heading:.1f}°")
 
     def set_pid_tuning(self, kp: float = None, ki: float = None, kd: float = None):
@@ -1463,7 +1273,7 @@ class HeadingLockController:
 def heading_lock_demo(duration: float = 60):
     """航向角锁定演示"""
     print("\n" + "=" * 60)
-    print("  航向角锁定自动驾驶演示 (档位表控制 + 50Hz)")
+    print("  航向角锁定自动驾驶演示 (PID控制 + 50Hz)")
     print("=" * 60)
 
     controller = HeadingLockController(
@@ -1482,7 +1292,7 @@ def heading_lock_demo(duration: float = 60):
         return
 
     print(f"\n[演示] 将运行 {duration} 秒...")
-    print("[提示] 尝试改变载体方向，系统会自动按档位表进行差速修正")
+    print("[提示] 尝试改变载体方向，系统会自动进行PID差速修正")
     print("[提示] 按 Ctrl+C 可随时停止\n")
 
     controller.run_loop(duration=duration)
@@ -1528,7 +1338,7 @@ def pid_tuning_helper():
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description='航向角锁定自动驾驶控制 (档位表 + GPS)')
+    parser = argparse.ArgumentParser(description='航向角锁定自动驾驶控制 (PID + GPS)')
     parser.add_argument('-d', '--duration', type=float, default=120,
                         help='运行时长(秒)，默认20秒')
     parser.add_argument('-p', '--port', type=str, default='/dev/ttyS0',
@@ -1536,7 +1346,7 @@ if __name__ == "__main__":
     parser.add_argument('-s', '--speed', type=int, default=70,
                         help='基础速度 (0-100)，默认80')
     parser.add_argument('-t', '--threshold', type=float, default=10.0,
-                        help='偏差死区阈值(度)，默认10度')
+                        help='偏差死区阈值(度)，默认5度')
     parser.add_argument('--kp', type=float, default=0.8,
                         help='PID比例系数；与 --pid-scale-deg 配合，约在该角度误差时 P≈kp')
     parser.add_argument('--ki', type=float, default=0.1,

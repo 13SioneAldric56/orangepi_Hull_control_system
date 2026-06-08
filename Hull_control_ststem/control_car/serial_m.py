@@ -24,7 +24,7 @@ from typing import Optional
 import serial
 
 # 与 serial_s.py 等保持一致的默认参数
-DEFAULT_PORT = "/dev/ttyUSB0"
+DEFAULT_PORT = "/dev/ttyUSB1"
 DEFAULT_BAUD = 115200
 
 FRAME_HEADER = bytes((0xAA, 0x55))

@@ -11,8 +11,9 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
 import time
-from typing import Optional, Protocol, runtime_checkable
+from typing import Callable, Optional, Protocol, runtime_checkable
 
 # 项目根目录 (Hull_control_ststem)，与 gps_navigation_controller 一致
 _Gps_dir = os.path.dirname(os.path.abspath(__file__))
@@ -40,7 +41,7 @@ BEARING_RECOMPUTE_SEC = 0.0
 DEFAULT_COMPASS_PORT = '/dev/ttyS0'
 DEFAULT_GPS_PORT = '/dev/ttyS1'
 DEFAULT_GPS_BAUDRATE = 115200
-DEFAULT_UART_PORT = '/dev/ttyUSB0'
+DEFAULT_UART_PORT = '/dev/ttyUSB1'
 DEFAULT_UART_BAUD = 115200
 # 无 --esc/--hbridge 时默认 uart3；与 heading_lock 一致请显式传 --hbridge
 DEFAULT_MOTOR_DRIVER = 'uart3'
@@ -188,15 +189,22 @@ def _snapshot_home(nav: GPSNavigationController) -> tuple[float, float]:
     return float(st.current_lat), float(st.current_lon)
 
 
+def _abort_requested(abort_event: Optional[threading.Event]) -> bool:
+    return abort_event is not None and abort_event.is_set()
+
+
 def _run_backward_pulse(
     nav: GPSNavigationController,
     duration_sec: float,
     speed: int,
     *,
     label: str = '到达',
+    abort_event: Optional[threading.Event] = None,
 ) -> None:
     """停止或停泊前：双轮后退若干秒后刹车。"""
     if duration_sec <= 0:
+        return
+    if _abort_requested(abort_event):
         return
     hl = getattr(nav, '_heading_lock', None)
     driver = getattr(hl, '_driver', None) if hl is not None else None
@@ -212,6 +220,8 @@ def _run_backward_pulse(
         driver.backward(speed)
         deadline = time.time() + duration_sec
         while time.time() < deadline:
+            if _abort_requested(abort_event):
+                break
             time.sleep(0.05)
     except Exception as exc:
         print(f'[往返任务] {label}：后退异常: {exc}')
@@ -264,6 +274,7 @@ def _wait_arrival_with_link_watch(
     phase: _PhaseLabel | None = None,
     leg_start_time: float | None = None,
     mission_start_time: float | None = None,
+    abort_event: Optional[threading.Event] = None,
 ) -> bool:
     """
     等待到达；若 GPS 串口/读线程异常或导航线程崩溃，则紧急刹车并 stop。
@@ -272,6 +283,11 @@ def _wait_arrival_with_link_watch(
     start = time.time()
     last_panel_time = 0.0
     while nav._is_running:
+        if _abort_requested(abort_event):
+            print('[往返任务] 收到中止信号，停止等待到达')
+            _emergency_brake_motors(nav)
+            nav.stop()
+            return False
         if nav._is_arrived:
             return True
         if timeout is not None and (time.time() - start) > timeout:
@@ -310,6 +326,8 @@ def run_roundtrip_mission(
     dest_lat: float,
     dest_lon: float,
     *,
+    abort_event: Optional[threading.Event] = None,
+    on_nav_created: Optional[Callable[[GPSNavigationController], None]] = None,
     compass_port: str = DEFAULT_COMPASS_PORT,
     gps_port: str = DEFAULT_GPS_PORT,
     gps_baudrate: int = DEFAULT_GPS_BAUDRATE,
@@ -332,10 +350,12 @@ def run_roundtrip_mission(
     magnetic_assist: Optional[MagneticAssistProvider] = None,
     display_interval_sec: float = DISPLAY_INTERVAL_SEC,
     reverse_on_stop_sec: float = REVERSE_ON_STOP_SEC,
-) -> None:
+) -> bool:
     """
     执行：前进车头校准（与默认 GPS 导航 / heading_lock GPS 流程一致）
     -> 去目的地 -> 后退若干秒 -> 停泊(停电机, 单次 dwell 倒计时) -> 回启动经纬度 -> 后退 -> 结束。
+
+    返回 True 表示完整往返成功；False 表示初始化失败、中止或中途异常。
     """
     assist: MagneticAssistProvider = magnetic_assist or _NoOpMagneticAssist()
 
@@ -373,7 +393,10 @@ def run_roundtrip_mission(
         use_forward_heading_calibration=True,
         bearing_recompute_interval=bearing_recompute_sec,
     )
+    if on_nav_created is not None:
+        on_nav_created(nav)
 
+    completed = False
     try:
         print('\n' + '=' * 60)
         print('  GPS 往返任务')
@@ -398,7 +421,11 @@ def run_roundtrip_mission(
 
         if not nav.initialize():
             print('[往返任务] 初始化失败')
-            return
+            return False
+        if _abort_requested(abort_event):
+            print('[往返任务] 初始化后收到中止')
+            nav.stop()
+            return False
 
         mission_start = time.time()
         phase = _PhaseLabel('航段1 · 驶向目的地')
@@ -425,24 +452,36 @@ def run_roundtrip_mission(
             phase=phase,
             leg_start_time=leg_start,
             mission_start_time=mission_start,
+            abort_event=abort_event,
         ):
             print('[往返任务] 未能到达目的地或已停止')
             if nav._is_running:
                 nav.stop()
-            return
+            return False
 
         if nav._nav_thread is not None:
             nav._nav_thread.join(timeout=30.0)
 
         _run_backward_pulse(
-            nav, reverse_on_stop_sec, base_speed, label='到达目的地·停泊前',
+            nav,
+            reverse_on_stop_sec,
+            base_speed,
+            label='到达目的地·停泊前',
+            abort_event=abort_event,
         )
+        if _abort_requested(abort_event):
+            nav.stop()
+            return False
         print('[往返任务] 已到达，停泊期内电机保持停止')
 
         dwell_deadline = time.time() + dwell_sec
         phase.text = '停泊倒计时'
         print(f'[往返任务] 停泊倒计时 {dwell_sec:.0f}s 开始（水面漂移不重置计时）')
         while time.time() < dwell_deadline:
+            if _abort_requested(abort_event):
+                print('[往返任务] 停泊期间收到中止')
+                nav.stop()
+                return False
             remaining = dwell_deadline - time.time()
             assist.on_dwell_tick(nav, elapsed_in_dwell=dwell_sec - remaining)
             _refresh_heading_lock_panel(
@@ -466,6 +505,7 @@ def run_roundtrip_mission(
             phase=phase,
             leg_start_time=leg_start,
             mission_start_time=mission_start,
+            abort_event=abort_event,
         ):
             print('[往返任务] 返航未完成或已停止')
             if nav._is_running:
@@ -474,13 +514,19 @@ def run_roundtrip_mission(
             if nav._nav_thread is not None:
                 nav._nav_thread.join(timeout=30.0)
             _run_backward_pulse(
-                nav, reverse_on_stop_sec, base_speed, label='返航到达·停止前',
+                nav,
+                reverse_on_stop_sec,
+                base_speed,
+                label='返航到达·停止前',
+                abort_event=abort_event,
             )
             print('[往返任务] 已到达返航点')
+            completed = not _abort_requested(abort_event)
 
         sys.stdout.write('\n')
         nav.stop()
         print('[往返任务] 结束')
+        return completed
     except KeyboardInterrupt:
         sys.stdout.write('\n')
         _shutdown_on_ctrl_c(nav)
@@ -553,7 +599,7 @@ def main() -> None:
     motor_group = parser.add_mutually_exclusive_group()
     motor_group.add_argument(
         '--uart3', action='store_true',
-        help='UART 串口电机帧 /dev/ttyUSB0 命令码 0x06（与 heading_lock --uart3 一致）',
+        help='UART 串口电机帧 /dev/ttyUSB1 命令码 0x06（与 heading_lock --uart3 一致）',
     )
     motor_group.add_argument(
         '--esc', action='store_true',

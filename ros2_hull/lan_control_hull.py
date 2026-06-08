@@ -10,7 +10,6 @@
 客户端 → 服务端:
     {"type":"set_target","target":{"lat":..,"lon":..}}
     {"type":"start"}
-    {"type":"start_roundtrip"}   # 往返：驶向目标 -> 停泊 -> 返回启动点（gps_roundtrip_mission）
     {"type":"stop"}
 
 用法:
@@ -46,16 +45,10 @@ if _root not in sys.path:
 from compass import OutputMode
 from compass.wrap import HeadingWrapReader
 from Gps.gps import GPSPosition, GPSReader
-from Gps.gps_roundtrip_mission import (
-    _emergency_brake_motors,
-    run_roundtrip_mission,
-)
 from heading_lock_control import (
     GPS_AVAILABLE,
     GpsNavigationRunOptions,
     HeadingLockController,
-    heading_gears_to_dicts,
-    DEFAULT_HEADING_GEARS,
     resolve_compass_settings,
     start_gps_navigation_session,
 )
@@ -63,18 +56,18 @@ from heading_lock_control import (
 DEFAULT_CONFIG_PATH = os.path.join(_root, "lan_control_config.yaml")
 LEGACY_CONFIG_PATH = os.path.join(_root, "lan_control_config_legacy.yaml")
 
-_GEAR_DEFAULTS = heading_gears_to_dicts(DEFAULT_HEADING_GEARS)
-
 # 导航档案：cli_gps 与本地 heading_lock_control.py --gps 一致；lan_legacy 为原 LAN 行为备案
 NAVIGATION_PROFILE_CLI_GPS = {
     "arrival_threshold": 5.0,
     "base_speed": 70,
     "motor_driver": "uart3",
     "esc_auto_unlock": True,
-    "straight_threshold_deg": 10.0,
-    "gear_hysteresis_deg": 2.0,
-    "heading_gears": _GEAR_DEFAULTS,
+    "pid_kp": 0.8,
+    "pid_ki": 0.1,
+    "pid_kd": 1.5,
+    "max_turn_strength": 0.2,
     "deviation_threshold": 10.0,
+    "pid_p_full_scale_deg": 25.0,
     "compass_mode": "auto_50hz",
     "use_heading_wrap": True,
     "uart_port": "/dev/ttyUSB1",
@@ -94,10 +87,12 @@ NAVIGATION_PROFILE_LAN_LEGACY = {
     "base_speed": 70,
     "motor_driver": "uart3",
     "esc_auto_unlock": True,
-    "straight_threshold_deg": 10.0,
-    "gear_hysteresis_deg": 2.0,
-    "heading_gears": _GEAR_DEFAULTS,
-    "deviation_threshold": 10.0,
+    "pid_kp": 0.8,
+    "pid_ki": 0.1,
+    "pid_kd": 1.5,
+    "max_turn_strength": 0.2,
+    "deviation_threshold": 5.0,
+    "pid_p_full_scale_deg": 25.0,
     "compass_mode": "auto_50hz",
     "use_heading_wrap": True,
     "uart_port": "/dev/ttyUSB1",
@@ -248,7 +243,6 @@ class StandbySensors:
         return self._active
 
     def stop(self) -> None:
-        had_device = self._gps_reader is not None or self._compass_reader is not None
         if self._gps_reader is not None:
             try:
                 self._gps_reader.disconnect()
@@ -262,9 +256,6 @@ class StandbySensors:
                 pass
             self._compass_reader = None
         self._active = False
-        # 等待内核释放串口，避免导航任务立即 open 同一端口时报 multiple access
-        if had_device:
-            time.sleep(0.25)
 
     def _start_gps(self) -> bool:
         try:
@@ -370,13 +361,6 @@ def load_config(path: str) -> Dict[str, Any]:
         navigation.get("run_duration_sec", nav_defaults["run_duration_sec"])
     )
 
-    straight_threshold_deg = float(
-        navigation.get(
-            "straight_threshold_deg",
-            nav_defaults.get("straight_threshold_deg", nav_defaults["deviation_threshold"]),
-        )
-    )
-
     return {
         "config_path": os.path.abspath(path),
         "navigation_profile": profile_name,
@@ -390,14 +374,12 @@ def load_config(path: str) -> Dict[str, Any]:
         "base_speed": _nav("base_speed", int),
         "motor_driver": str(_nav("motor_driver", str)),
         "esc_auto_unlock": _nav("esc_auto_unlock", bool),
-        "straight_threshold_deg": straight_threshold_deg,
-        "gear_hysteresis_deg": float(
-            navigation.get("gear_hysteresis_deg", nav_defaults.get("gear_hysteresis_deg", 2.0))
-        ),
-        "heading_gears": navigation.get(
-            "heading_gears", nav_defaults.get("heading_gears", _GEAR_DEFAULTS)
-        ),
-        "deviation_threshold": straight_threshold_deg,
+        "pid_kp": _nav("pid_kp", float),
+        "pid_ki": _nav("pid_ki", float),
+        "pid_kd": _nav("pid_kd", float),
+        "max_turn_strength": _nav("max_turn_strength", float),
+        "deviation_threshold": _nav("deviation_threshold", float),
+        "pid_p_full_scale_deg": _nav("pid_p_full_scale_deg", float),
         "compass_mode": str(_nav("compass_mode", str)),
         "use_heading_wrap": _nav("use_heading_wrap", bool),
         "uart_port": str(_nav("uart_port", str)),
@@ -410,9 +392,6 @@ def load_config(path: str) -> Dict[str, Any]:
         "post_arrival_reverse_speed": post_arrival_reverse_speed,
         "uart_debug_tx": uart_debug_tx,
         "confirm_interactive": _nav("confirm_interactive", bool),
-        "roundtrip_dwell_sec": float(
-            navigation.get("roundtrip_dwell_sec", navigation.get("dwell_sec", 5.0))
-        ),
     }
 
 
@@ -436,22 +415,7 @@ class LanControlHull:
         self._connected = False
         self._nav_thread: Optional[threading.Thread] = None
         self._controller: Optional[HeadingLockController] = None
-        self._roundtrip_nav: Optional[Any] = None
-        self._mission_mode: Optional[str] = None  # "navigate" | "roundtrip"
         self._abort_nav = threading.Event()
-        self._standby_lock = threading.Lock()
-
-    def _release_standby_sensors(self, reason: str) -> None:
-        """任务启动前释放待机 GPS/罗盘，避免与导航控制器争用同一串口。"""
-        with self._standby_lock:
-            if self._standby._active:
-                print(f"[传感器] 释放待机资源 ({reason})")
-                self._standby.stop()
-
-    def _restore_standby_sensors(self) -> None:
-        with self._standby_lock:
-            if not self._get_runtime().running:
-                self._standby.start()
 
     def _set_runtime(self, **kwargs) -> None:
         with self._state_lock:
@@ -475,20 +439,7 @@ class LanControlHull:
         runtime = self._get_runtime()
         controller = self._controller
 
-        roundtrip_nav = self._roundtrip_nav
-        if (
-            runtime.running
-            and self._mission_mode == "roundtrip"
-            and roundtrip_nav is not None
-        ):
-            state = roundtrip_nav.get_state()
-            pos_ok = state.current_lat != 0.0 or state.current_lon != 0.0
-            current_lat = round_coord(state.current_lat) if pos_ok else 0.0
-            current_lon = round_coord(state.current_lon) if pos_ok else 0.0
-            heading = round(state.current_heading, 1) if state.compass_calibrated else 0.0
-            target_lat = round_coord(state.target_lat)
-            target_lon = round_coord(state.target_lon)
-        elif runtime.running and controller is not None and controller._gps_enabled and controller._gps_navigation:
+        if runtime.running and controller is not None and controller._gps_enabled and controller._gps_navigation:
             nav = controller._gps_navigation
             state = nav._state
             pos_ok = state.current_lat != 0.0 or state.current_lon != 0.0
@@ -509,16 +460,13 @@ class LanControlHull:
                 target_lat = 0.0
                 target_lon = 0.0
 
-        payload: Dict[str, Any] = {
+        return {
             "type": "state",
             "current": {"lat": current_lat, "lon": current_lon},
             "target": {"lat": target_lat, "lon": target_lon},
             "heading": heading,
             "running": runtime.running,
         }
-        if runtime.running and self._mission_mode:
-            payload["mode"] = self._mission_mode
-        return payload
 
     def _send_ack(self, cmd: str, ok: bool, message: str = "") -> None:
         payload: Dict[str, Any] = {"type": "ack", "cmd": cmd, "ok": ok}
@@ -558,7 +506,7 @@ class LanControlHull:
 
     def _safe_stop_navigation(self, reason: str) -> None:
         runtime = self._get_runtime()
-        if not runtime.running and self._controller is None and self._roundtrip_nav is None:
+        if not runtime.running and self._controller is None:
             return
         print(f"[导航] 安全停车: {reason}")
         self._abort_nav.set()
@@ -570,21 +518,12 @@ class LanControlHull:
                     controller._driver.stop()
             except OSError:
                 pass
-        roundtrip_nav = self._roundtrip_nav
-        if roundtrip_nav is not None:
-            try:
-                roundtrip_nav._is_running = False
-                _emergency_brake_motors(roundtrip_nav)
-                roundtrip_nav.stop()
-            except Exception as exc:
-                print(f"[往返] 停止清理异常: {exc}")
         if self._nav_thread and self._nav_thread.is_alive():
-            self._nav_thread.join(timeout=8.0)
+            self._nav_thread.join(timeout=5.0)
         self._controller = None
-        self._roundtrip_nav = None
-        self._mission_mode = None
         self._set_runtime(running=False)
-        self._restore_standby_sensors()
+        if not self._standby._active:
+            self._standby.start()
 
     def _start_listener(self) -> bool:
         if self._server_sock is not None:
@@ -692,9 +631,6 @@ class LanControlHull:
         if msg_type == "start":
             self._handle_start()
             return
-        if msg_type == "start_roundtrip":
-            self._handle_start_roundtrip()
-            return
         if msg_type == "stop":
             self._handle_stop()
             return
@@ -748,13 +684,6 @@ class LanControlHull:
         if action == "stop":
             self._handle_stop()
             return
-        if action == "start_roundtrip":
-            parsed = self._parse_target(msg)
-            if parsed is not None:
-                lat, lon = parsed
-                self._set_runtime(target_lat=lat, target_lon=lon, target_set=True)
-            self._handle_start_roundtrip()
-            return
         print(f"[命令] 未知 action: {action}")
 
     def _handle_start(self) -> None:
@@ -784,10 +713,8 @@ class LanControlHull:
 
         lat = runtime.target_lat
         lon = runtime.target_lon
-        self._release_standby_sensors("单程导航启动")
         self._set_runtime(running=True, gps_valid=True)
         self._abort_nav.clear()
-        self._mission_mode = "navigate"
         self._nav_thread = threading.Thread(
             target=self._navigation_worker,
             args=(lat, lon),
@@ -797,46 +724,6 @@ class LanControlHull:
         self._nav_thread.start()
         print(f"[命令] 收到 start，目标=({lat:.5f}, {lon:.5f})")
         self._send_ack("start", True)
-
-    def _handle_start_roundtrip(self) -> None:
-        runtime = self._get_runtime()
-        if runtime.running:
-            print("[命令] 已在运行中，忽略 start_roundtrip")
-            self._send_ack("start_roundtrip", False, "已在运行中")
-            return
-
-        if not runtime.target_set:
-            print("[命令] 未设置目标，拒绝 start_roundtrip")
-            self._send_ack("start_roundtrip", False, "请先设置目标点")
-            return
-
-        if not GPS_AVAILABLE:
-            print("[命令] GPS 模块不可用，拒绝往返")
-            self._send_ack("start_roundtrip", False, "GPS 模块不可用")
-            return
-
-        _, _, _, gps_valid = self._standby.snapshot()
-        if not gps_valid:
-            print("[命令] GPS 无效，拒绝往返")
-            self._send_ack("start_roundtrip", False, "GPS 无效")
-            return
-
-        lat = runtime.target_lat
-        lon = runtime.target_lon
-        self._release_standby_sensors("往返任务启动")
-        self._set_runtime(running=True, gps_valid=True)
-        self._abort_nav.clear()
-        self._mission_mode = "roundtrip"
-        self._roundtrip_nav = None
-        self._nav_thread = threading.Thread(
-            target=self._roundtrip_worker,
-            args=(lat, lon),
-            daemon=True,
-            name="gps-roundtrip",
-        )
-        self._nav_thread.start()
-        print(f"[命令] 收到 start_roundtrip，目的地=({lat:.5f}, {lon:.5f})")
-        self._send_ack("start_roundtrip", True)
 
     def _handle_stop(self) -> None:
         if self._get_runtime().running:
@@ -851,9 +738,11 @@ class LanControlHull:
             compass_port=self.config["compass_port"],
             base_speed=self.config["base_speed"],
             deviation_threshold=self.config["deviation_threshold"],
-            straight_threshold_deg=self.config["straight_threshold_deg"],
-            gear_hysteresis_deg=self.config["gear_hysteresis_deg"],
-            heading_gears=self.config["heading_gears"],
+            pid_kp=self.config["pid_kp"],
+            pid_ki=self.config["pid_ki"],
+            pid_kd=self.config["pid_kd"],
+            max_turn_strength=self.config["max_turn_strength"],
+            pid_p_full_scale_deg=self.config["pid_p_full_scale_deg"],
             arrival_threshold_m=self.config["arrival_threshold"],
             motor_driver=self.config["motor_driver"],
             esc_auto_unlock=self.config["esc_auto_unlock"],
@@ -884,6 +773,7 @@ class LanControlHull:
             self._send_json({"type": "status", "state": "error", "message": "GPS 模块不可用"})
             return
 
+        self._standby.stop()
         controller = self._build_controller()
         self._controller = controller
         started = False
@@ -918,62 +808,16 @@ class LanControlHull:
             except Exception as exc:
                 print(f"[导航] 停止清理异常: {exc}")
             self._controller = None
-            self._mission_mode = None
             self._set_runtime(running=False)
-            self._restore_standby_sensors()
+            self._standby.start()
             print("[导航] 已回到待机")
-
-    def _on_roundtrip_nav_created(self, nav: Any) -> None:
-        self._roundtrip_nav = nav
-
-    def _roundtrip_worker(self, lat: float, lon: float) -> None:
-        reverse_sec = float(self.config.get("post_arrival_reverse_sec", 0.0))
-        try:
-            completed = run_roundtrip_mission(
-                lat,
-                lon,
-                abort_event=self._abort_nav,
-                on_nav_created=self._on_roundtrip_nav_created,
-                compass_port=self.config["compass_port"],
-                gps_port=self.config["gps_port"],
-                gps_baudrate=self.config["gps_baudrate"],
-                arrival_threshold_m=self.config["arrival_threshold"],
-                dwell_sec=self.config["roundtrip_dwell_sec"],
-                bearing_recompute_sec=self.config["bearing_recompute_interval"],
-                base_speed=self.config["base_speed"],
-                deviation_threshold_deg=self.config["deviation_threshold"],
-                motor_driver=self.config["motor_driver"],
-                uart_port=self.config["uart_port"],
-                uart_baud=self.config["uart_baud"],
-                esc_auto_unlock=self.config["esc_auto_unlock"],
-                use_heading_wrap=self.config["use_heading_wrap"],
-                reverse_on_stop_sec=reverse_sec if reverse_sec > 0 else 5.0,
-            )
-            if self._abort_nav.is_set():
-                self._send_json({"type": "status", "state": "stopped"})
-            elif completed:
-                self._send_status("roundtrip_complete")
-            else:
-                self._send_json(
-                    {"type": "status", "state": "error", "message": "往返任务未完成"},
-                )
-        except Exception as exc:
-            print(f"[往返] 运行异常: {exc}")
-            self._send_json({"type": "status", "state": "error", "message": str(exc)})
-        finally:
-            self._roundtrip_nav = None
-            self._mission_mode = None
-            self._set_runtime(running=False)
-            self._restore_standby_sensors()
-            print("[往返] 已回到待机")
 
     def _report_loop(self) -> None:
         interval = max(0.2, float(self.config["report_interval"]))
         while self._running:
             if self._connected:
-                # 任务运行中由导航/往返控制器独占 GPS/罗盘，勿再读待机串口
+                lat, lon, heading, gps_valid = self._standby.snapshot()
                 if not self._get_runtime().running:
-                    lat, lon, heading, gps_valid = self._standby.snapshot()
                     self._set_runtime(
                         current_lat=lat if gps_valid else 0.0,
                         current_lon=lon if gps_valid else 0.0,

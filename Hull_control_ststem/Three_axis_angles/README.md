@@ -87,7 +87,7 @@ for data in compass.read_continuous(interval=0.1):
 #### `__init__(port, baudrate=9600, timeout=1.0)`
 初始化罗盘对象
 
-- `port`: 串口号，如 `'/dev/ttyS0'` 或 `'/dev/ttyUSB0'`
+- `port`: 串口号，如 `'/dev/ttyS0'` 或 `'/dev/ttyUSB1'`
 - `baudrate`: 波特率，默认 9600
 - `timeout`: 超时时间（秒）
 

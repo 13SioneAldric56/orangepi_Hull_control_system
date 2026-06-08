@@ -2,7 +2,7 @@
 #
 # navigation.profile:
 #   cli_gps    — 与本地 python heading_lock_control.py --gps 一致（默认）
-#   lan_legacy — 原 LAN 行为备案（到达后后退 5s 等）
+#   lan_legacy — 原 LAN 行为备案（到达后后退 5s、deviation_threshold=5 等）
 #
 # 启用备案: python lan_control_hull.py --legacy
 # 或指定:   python lan_control_hull.py --config lan_control_config_legacy.yaml
@@ -25,16 +25,12 @@ navigation:
   base_speed: 70
   motor_driver: "uart3"
   esc_auto_unlock: true
-  # 航向档位控制（≤straight_threshold_deg 直行；>30° 正反转）
-  straight_threshold_deg: 10.0
-  gear_hysteresis_deg: 2.0
-  heading_gears:
-    - { max_error_deg: 30, left: 0.5,  right: 1.0,  label: "1档·双前进", mode: forward_diff }
-    - { max_error_deg: 50, left: -0.5, right: 0.5,  label: "2档·50%",    mode: spin }
-    - { max_error_deg: 70, left: -0.7, right: 0.7,  label: "3档·70%",    mode: spin }
-    - { max_error_deg: 90, left: -0.9, right: 0.9,  label: "4档·90%",    mode: spin }
-    - { max_error_deg: 9999, left: -1.0, right: 1.0, label: "5档·满转",   mode: spin }
+  pid_kp: 0.8
+  pid_ki: 0.1
+  pid_kd: 1.5
+  max_turn_strength: 0.2
   deviation_threshold: 10.0
+  pid_p_full_scale_deg: 25
   compass_mode: auto_50hz
   use_heading_wrap: true
   uart_port: "/dev/ttyUSB1"
@@ -44,8 +40,6 @@ navigation:
   bearing_recompute_interval: 0.0
   run_duration_sec: 0
   post_arrival_reverse_sec: 0
-  # 往返任务（start_roundtrip）：到达后停泊秒数；到达/返航停止前后退秒数见 post_arrival_reverse_sec（为 0 时往返默认 5s）
-  roundtrip_dwell_sec: 5.0
   # post_arrival_reverse_speed: 90
   # uart_debug_tx: false
   # confirm_interactive: false
