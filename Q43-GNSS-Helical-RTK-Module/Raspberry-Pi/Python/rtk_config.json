@@ -1,0 +1,16 @@
+{
+  "serial_port": "/dev/ttyUSB0",
+  "baud_rate": 115200,
+  "caster_host": "164.90.243.252",
+  "caster_port": 2101,
+  "username": "lb1020",
+  "password": "776spe",
+  "mountpoint": "MP24981",
+  "send_gga": false,
+  "gga_interval_sec": 10.0,
+  "init_cmd": "$POLCFGRTCM,1,1,1",
+  "save_cmd": "$POLCFGSAVE",
+  "custom_cmd": "",
+  "socket_timeout_sec": 15,
+  "reconnect_sec": 3.0
+}
